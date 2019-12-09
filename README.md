@@ -46,6 +46,9 @@ Our data is stored in Postgres and can be accessed from RStudio with RPostgres a
 Table incidents should be created by running the ddl script gunviolence_incidents_table_ddl.sql
 Dump file of the database can be found in the repository, extract and restore in Postgres.
 
+Connection string in R expects host, username, password and database.
+
 ## 3- Load RStudio rmd file
 
 Load file Gun Violence Final Project.Rmd to access the Project.
+
