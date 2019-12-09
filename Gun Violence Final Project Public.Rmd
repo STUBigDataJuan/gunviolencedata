@@ -1,0 +1,539 @@
+---
+title: "Gun Violence Final Project"
+authors: "Athena Liao | Marcel Socorro | Juan Carballo | Moises Vasquez"
+class: "CIS 543 Programming for Data Analytics"
+instructor: "Dr. Sean Mondesire"
+output: html_notebook
+---
+
+A _Programming for Data Analytics_ project by Athena Liao, Marcel Socorro, Juan Carballo, and Moises Vasquez.
+
+# The Problem {.tabset .tabset-pills .tabset-fade}
+
+What are the factors to prescribe fewer people killed related to gun incidents?
+
+## Text Analysis
+```{r echo=FALSE}
+# Load all the libraries
+library(tidyverse)
+library(stringr)
+library(tm)
+library(quanteda)
+library(reshape2)
+library(lda)
+library(wordcloud)
+library(ggthemes)
+library(qcc)
+library(qicharts2)
+library(zoo)
+library(mapdata)
+library(forecast)
+library(scales)
+library(e1071)
+library(caTools)
+library(Metrics)
+library(rpart)
+library(rpart.plot)
+library("RPostgres")
+library(DBI)
+```
+
+Connecting to AWS RDS - Postgres
+```{r}
+con <- dbConnect(RPostgres::Postgres(),dbname = 'database', 
+                 host = 'host',
+                 port = 5432,
+                 user = 'postgres',
+                 password = 'password')
+
+```
+
+Selecting all records from incidents table
+```{r}
+dbListTables(con)
+res <- dbSendQuery(con, "SELECT * FROM incidents")
+data<- data.frame(dbFetch(res))
+```
+
+Setting up the right date formats
+```{r}
+data$date<-as.Date(data$date,"%m/%d/%Y")
+data$Month <- format(as.Date(data$date), "%m")
+data$Year <- format(as.Date(data$date), "%Y")
+data$n_guns_involved <- as.integer(data$n_guns_involved)
+data<-subset(data,!Year==2013)
+```
+
+Document Feature Matrix (DFM)
+```{r}
+gunsDFM <- dfm(data$notes,
+                remove_punct = TRUE,
+                remove = stopwords("english"))
+```
+
+Top Features
+```{r}
+topfeatures(gunsDFM)
+```
+
+Weight Frequency
+```{r}
+textstat_frequency(gunsDFM)
+wordcloud_freq<-textstat_frequency(gunsDFM)
+wordcloud_freq <- wordcloud_freq %>%
+  rename(freq = frequency)
+```
+
+```{r}
+wordcloud_histogram = head(wordcloud_freq,10)
+
+ggplot(data=wordcloud_histogram, aes(x=feature,y=freq,fill = feature)) +
+  geom_bar(position="dodge",stat="identity") + 
+  coord_flip() +
+  labs(title="Text Analysis Frequency Distribution", x="Feature", y="Frequency")+
+  theme_few()+
+  scale_fill_gdocs()+ 
+  theme(legend.position = "none")
+```
+
+
+```{r}
+# The wordcloud package is loaded
+
+# Create a wordcloud for the values in word_freqs
+wordcloud(wordcloud_freq$feature, wordcloud_freq$freq,
+  max.words = 100,colors = "blue")
+```
+
+![](https://www.caciqueinc.com/wp-content/uploads/2017/12/blank-overlay.png)
+
+## Exploratory Analysis 
+```{r}
+us<-map_data('state')
+```
+```{r}
+#Plotting Incidents in a ggmap 
+ggplot(data,aes(longitude,latitude)) +
+  geom_polygon(data=us,aes(x=long,y=lat,group=group),color='black',fill=NA,alpha=.35)+
+  geom_point(aes(color = "incident"),size=.15,alpha=.3) +
+  xlim(-125,-65)+ylim(20,50)+labs(title="Heat map gun incidents (01/01/14-03/31/18) USA")+ theme_few() 
+```
+```{r}
+byState<-group_by(data,state,Year)
+summary1<-summarize(byState,incident=n(),killed=sum(n_killed))
+summary1<-subset(summary1,!Year==2018)
+avgState<-group_by(summary1,state)
+summary2<-summarize(avgState,AvgIncident=mean(incident),AvgKilled=mean(killed))
+summary2<-summary2[order(-summary2$AvgKilled),]
+```
+```{r}
+#Grouping the states by order of importance in incident numbers
+statesKilled<-data.frame("State"=summary2$state,"AvgKilled"=summary2$AvgKilled)
+trivialStates<-subset(statesKilled,AvgKilled<266)
+mainStates<-subset(statesKilled,AvgKilled>266)
+otherStates<-data.frame(State="others","AvgKilled"=sum(trivialStates$AvgKilled))
+destParetoStates<-rbind(mainStates,otherStates)
+```
+```{r}
+#Graphing Pareto
+TipoStates<-destParetoStates$AvgKilled
+names(TipoStates)<-(destParetoStates$State)
+TipoStates
+pareto.chart(TipoStates,cumperc=seq(0,100,by=20,ylim=100),main='Pareto Chart Main States & yearly Avg people killed by Gun Violence')
+```
+
+```{r}
+#Grouping the data by Month and Year
+byMonthYear<-group_by(data,Month,Year)
+summary3<-summarize(byMonthYear,incident=n(),killed=sum(n_killed))
+summary3$ym<-paste(summary3$Year,summary3$Month,sep = "")
+summary3$ym<-as.double(summary3$ym)
+summary3$ym<- as.yearmon(as.character(summary3$ym), "%Y%m")
+summary3<-summary3[order(summary3$ym),]
+```
+```{r}
+#Plotting Number of people killed by Month and Year
+ggplot(data=summary3,aes(ym,killed))+geom_point(aes(color=Year))+geom_line(aes(color=Year))+geom_smooth()+labs(title="People killed by Gun incident each Month(Jan-14 to March-18) USA",y="People killed",x="Jan-14 to March-18")+ theme_few() + scale_color_gdocs()
+```
+
+![](https://www.caciqueinc.com/wp-content/uploads/2017/12/blank-overlay.png)
+
+## Time Series Model
+```{r}
+#Getting the time Series Model
+test<-tail(summary3,12)
+tsData<-ts (summary3$killed, start=c(2014,1), end=c(2017,3),frequency=12)
+tsData
+plot(tsData)
+```
+
+```{r}
+#Decomposing the Time Series Model
+decomposedRes <- decompose(tsData)
+stlRes <- stl(tsData, s.window = "period")
+plot (decomposedRes, type="o", col="red", lty="dashed")
+decomposedRes
+```
+```{r}
+#Forecasting the Model
+arimaModel<-auto.arima(tsData)
+arimaForecast<-forecast(arimaModel,h=12)
+arimaForecast
+```
+```{r}
+arimaForecast<-data.frame(arimaForecast)
+```
+```{r}
+#Comparing the testing dataset vs the prediction 
+month<-test$Month
+actual<-data.frame(month,"killed"=test$killed)
+prediction<-data.frame(month,"killed"=arimaForecast$Point.Forecast)
+actual$status<-"actual"
+prediction$status<-"prediction"
+TimeSeries<-rbind(actual,prediction)
+tsdata<-data.frame(prediction$month,actual$killed,prediction$killed)
+head(tsdata)
+```
+```{r}
+#Getting Root Mean Square Error
+rmseTS<-rmse(actual$killed, prediction$killed)
+cat("Root Mean Square Error:",rmseTS)
+```
+
+```{r}
+#Plotting Model Prediction vs Testing set
+TimeSeries$month<-as.double(TimeSeries$month)
+ggplot(TimeSeries,aes(month,killed))+geom_point()+geom_line(aes(color=status))+geom_smooth()+scale_x_continuous(breaks=pretty_breaks())+labs(title="Monthly Average Number of Killed (Actual vs Prediction)",x="Month",y="# of killed")+ theme_few() + scale_color_gdocs()
+```
+
+![](https://www.caciqueinc.com/wp-content/uploads/2017/12/blank-overlay.png)
+
+## Clustering Model
+```{r}
+#Grouping the data by State, Month and Year
+byMYState<-group_by(data,state,Year,Month)
+summary4<-summarize(byMYState,incident=n(),killed=sum(n_killed))
+avgMYState<-group_by(summary4,state)
+summary5<-summarize(avgMYState,AvgIncident=mean(incident),AvgKilled=mean(killed))
+```
+For Clustering Analysis, monthly average per state is going to be used instead of a particular value for state in a given month and Year, because this way it's avoided that state could be classified in more than 1 class
+```{r}
+#set the random seed
+set.seed(123)
+```
+```{r}
+#Extract only Average of people killed and Average of incidents per month data for clustering
+state<-data.frame(summary5$AvgIncident , summary5$AvgKilled)
+head(state)
+```
+```{r}
+#Getting the ideal K
+wss<-numeric(15)
+for (k in 1:15)
+  wss[k]=sum(kmeans(state, k,nstart=25)$withinss)
+```
+```{r}
+options(scipen=999)
+wssResults<-data.frame(k=c(1:15),wss=wss)
+wssResults
+```
+```{r}
+#Getting the ideal K graphically
+ggplot(data=wssResults,aes(x=k,y=wss))+geom_point()+geom_line()+labs(title="K-means:States",x="Number of Clusters k",y="Within Sum of Squares")
+```
+```{r}
+#Assigning clusters
+stateCluster<-kmeans(state,3,nstart=25)
+stateCluster
+```
+
+```{r}
+#Add the cluster assignment to each point
+state$Cluster<-as.factor(stateCluster$cluster)
+
+#Get Centroids
+centroids<-as.data.frame((stateCluster$centers))
+centroids$Cluster<-as.factor(c(1:3))
+
+#Visualize cluster assignments
+ggplot(data=state,aes(summary5.AvgIncident,summary5.AvgKilled,color=Cluster))+geom_point()+geom_point(data=centroids,aes(x=summary5.AvgIncident,y=summary5.AvgKilled,color=Cluster),size=5,shape=13)+labs(title="Monthly average Number of Incidents vs People Killed",x="Monthly Average Number of Gun Incidents",y="Monthly Average People killed")+ theme_few() + scale_color_gdocs()
+```
+
+```{r}
+#Setting the cluster for each state
+table(state$Cluster,summary5$state)
+stateCluster<-data.frame(state$Cluster,summary5$state)
+```
+For correlation Analysis the dataset to be used is summary 4, is not necessary to work with averages.Let's also include the cluster class already defined in the previous analysis.
+```{r}
+#Getting correlation coefficient between people killed 
+cor(summary4$incident,summary4$killed)
+```
+Correlation coeffiecient between these 2 variables is strong. Quantity of people killed per month is going to be estimated through the variable Quantity of incidents per month, adding also the variable Class previously determined in Clustering Analyisis
+```{r}
+#Including Cluster_Class in the dataset
+names(stateCluster) <- c("class","state")
+Cluster_1 <- stateCluster$state[stateCluster$class == 1]
+Cluster_2 <- stateCluster$state[stateCluster$class == 2]
+Cluster_3 <- stateCluster$state[stateCluster$class == 3]
+summary4$Class_1 <- ifelse(summary4$state %in% Cluster_1,1,0)
+summary4$Class_2 <- ifelse(summary4$state %in% Cluster_2,1,0)
+summary4$Class_3 <- ifelse(summary4$state %in% Cluster_3,1,0)
+```
+![](https://www.caciqueinc.com/wp-content/uploads/2017/12/blank-overlay.png)
+
+## Linear Regression Model
+```{r}
+#Separating randomly the dataset into training and testing
+smp_siz = floor(0.75*nrow(summary4)) 
+smp_siz 
+set.seed(123)  
+train_ind = sample(seq_len(nrow(summary4)),size = smp_siz)
+trainReg =summary4[train_ind,] 
+testr=summary4[-train_ind,]
+drop<-c("Year","state","killed","Month")
+testReg <-testr[,!(names(testr)%in%drop)]
+```
+```{r}
+#Declaring Class as Factor and getting Linear Regresion Model
+trainReg$Class_1<-as.factor(trainReg$Class_1)
+trainReg$Class_2<-as.factor(trainReg$Class_2)
+trainReg$Class_3<-as.factor(trainReg$Class_3)
+testReg$Class_1<-as.factor(testReg$Class_1)
+testReg$Class_2<-as.factor(testReg$Class_2)
+testReg$Class_3<-as.factor(testReg$Class_3)
+LinReg<-lm(killed~incident+Class_1+Class_2+Class_3,data=trainReg)
+summary(LinReg)
+```
+Model gotten is:
+killed=incident*.1669 + Class_1*8.483 + Class_2*34.19 + 2.1659
+```{r}
+#Storing predicted values into the testing set
+testReg$predicted<-predict.lm(LinReg,testReg)
+testReg$killed<-testr$killed
+```
+```{r}
+#Calculating RMSE
+rmseLinReg<-rmse(testReg$killed, testReg$predicted)
+cat("Root Mean Square Error:",rmseLinReg)
+```
+
+```{r}
+testReg$Cluster <- ifelse(testReg$Class_1 == 1,"Class 1",ifelse(testReg$Class_2 == 1,"Class 2","Class 3"))
+```
+```{r}
+#Graphing the model prediction vs actual values
+testReg$Cluster<-as.factor(testReg$Cluster)
+ggplot(testReg)+geom_point(aes(x=incident,killed,color=Cluster))+geom_point(aes(x=incident,predicted),color="black")+labs(title="Monthly Number of Incidents by States vs People Killed",x="Monthly Number of  Incidents",y="Monthly People killed")+ theme_few() + scale_color_gdocs()
+```
+
+![](https://www.caciqueinc.com/wp-content/uploads/2017/12/blank-overlay.png)
+
+## Linear Logistic Regression
+
+```{r}
+# Tidying for Logistic, Niave Bayes and Ctree Models
+guns <- data %>% select(date,state,n_killed,n_injured,incident_characteristics,latitude,longitude,n_guns_involved,notes,participant_age_group,participant_gender,state)
+#guns$N_Childs <- str_count(guns$participant_age_group, 'Child')
+#guns$N_Teens <- str_count(guns$participant_age_group, 'Teen')
+#guns$N_Adults <- str_count(guns$participant_age_group, 'Adult')
+guns$N_Male <- str_count(guns$participant_gender, 'Male')
+guns$N_Female <- str_count(guns$participant_gender, 'Female')
+guns$killed <- ifelse(guns$n_killed == 0, 0,1)
+guns$died <- ifelse(guns$n_killed == 0, "no","yes")
+guns$died <- as.factor(guns$died)
+
+guns$Class_1 <- 0
+guns$Class_2 <- 0
+guns$Class_3 <- 0
+
+guns$Class_1 <- ifelse(guns$state %in% Cluster_1,1,0)
+guns$Class_2 <- ifelse(guns$state %in% Cluster_2,1,0)
+guns$Class_3 <- ifelse(guns$state %in% Cluster_3,1,0)
+
+guns <- guns %>% filter(!is.na(n_guns_involved))
+
+guns <- guns %>% select(n_injured,n_guns_involved,N_Male,N_Female,Class_1,Class_2,Class_3,killed,died)
+#guns <- drop_na(data)
+```
+
+
+```{r}
+# Slpit Data for Logistic, Niave Bayes and Ctree Models
+set.seed(123)
+sample <- sample.split(guns$n_injured,SplitRatio = .70)
+train2 <- subset(guns, sample == TRUE)
+test2 <- subset(guns, sample == FALSE)
+```
+
+
+
+```{r}
+glmKilled <- glm(data = train2, killed ~ n_injured + n_guns_involved + N_Male + N_Female + Class_1 + Class_2 + Class_3, family = "binomial")
+
+predGLM <- predict(glmKilled, newdata = test2, type = "response")
+
+#table(test2$killed, predGLM,
+      #dnn = c("Actual","Prediction"))
+
+#data.frame(test2, prediction = predGLM)
+
+result_probGLM <- data.frame(Actual = test2$killed, Prediction = predGLM)
+result_probGLM$PredictionClass <- ifelse(result_probGLM$Prediction > 0.5,1,0)
+
+result_probGLM <- drop_na(result_probGLM)
+# TP,TN, FP, FN
+TPglm <- subset(result_probGLM, Actual == 1 & PredictionClass == 1)
+TNglm <- subset(result_probGLM, Actual == 0 & PredictionClass == 0)
+FPglm <- subset(result_probGLM, Actual == 0 & PredictionClass == 1)
+NPglm <- subset(result_probGLM, Actual == 1 & PredictionClass == 0)
+
+# Precision
+precisionGLM <- (nrow(TPglm)) / (nrow(test2))
+cat("The precision of GLM is :" , precisionGLM, "\n")
+
+# Accuracy
+accuracyGLM <- (nrow(TPglm)) / (nrow(TPglm) + nrow(FPglm))
+cat("The accuracy of GLM is :" , accuracyGLM, "\n")
+
+# Recall
+recallGLM <- (nrow(TPglm)) / (nrow(TPglm) + nrow(NPglm))
+cat("The recall of GLM is :" , recallGLM, "\n")
+
+```
+
+
+```{r}
+# GLM Plot
+# library(ggthemes)
+glmActual <- data.frame(data = result_probGLM$Actual, type = "Actual")
+glmPredic <- data.frame(data = result_probGLM$PredictionClass, type = "Predicted")
+gPlot <- rbind(glmActual,glmPredic)
+gPlot$data <- ifelse(gPlot$data == 1, "yes","no")
+glmPlot <- ggplot(gPlot, aes(data, fill = data)) + geom_bar() + facet_wrap(~type) + theme_few() + scale_fill_gdocs() + labs( title = "Logistic Regression Accuracy Comparison", x = "People Killed", y = "Amount", fill = "Killed")
+glmPlot
+#ggsave(filename = "Logistic Accuracy.png", plot = glmPlot, device = "png")
+```
+
+![](https://www.caciqueinc.com/wp-content/uploads/2017/12/blank-overlay.png)
+
+## Naive Bayes Model
+```{r}
+# Building the Naive Bayes Classifier
+naive <- naiveBayes(died ~ n_injured + n_guns_involved + N_Male + N_Female + Class_1 + Class_2 + Class_3, data = train2, laplace = 1)
+naive_prediction <- predict(naive, test2, type = "class")
+
+# Get TP + TF
+naive_results <- data.frame(Actual = test2$died, Prediction = naive_prediction)
+accurateRowsnaive <- subset(naive_results, Actual == Prediction)
+
+# Calculate Accuracy
+naive_accuracy <- nrow(accurateRowsnaive)/nrow(test2)
+
+# Calculate Recall
+naive_TP <- subset(naive_results, Actual == "yes" & Prediction == "yes")
+naive_FN <- subset(naive_results,Actual == "yes" & Prediction == "no")
+naive_recall <- nrow(naive_TP)/(nrow(naive_TP)+nrow(naive_FN))
+
+# Calculate Precistion 
+naive_FP <- subset(naive_results, Actual == "no" & Prediction == "yes")
+naive_precision <- nrow(naive_TP)/(nrow(naive_TP)+nrow(naive_FP))
+cat("\n","LaPlace of 1 Accuracy:", naive_accuracy,"\n", "LaPlace of 1 Recall:", naive_recall,"\n","LaPlace of 1 Precision:",naive_precision,"\n")
+
+```
+
+```{r}
+# Naive Bayes Plot
+nActual <- data.frame(data = naive_results$Actual, type = "Actual")
+nPredic <- data.frame(data = naive_prediction, type = "Predicted")
+nPlot <- rbind(nActual,nPredic)
+naivePlot <- ggplot(nPlot, aes(data, fill = data)) + geom_bar() + facet_wrap(~type) + theme_few() + scale_fill_gdocs() + labs( title = "Naive Bayes Accuracy Comparison", x = "People Killed", y = "Amount", fill = "Killed")
+naivePlot
+#ggsave(filename = "Naive Bayes Accuracy.png", plot = naivePlot, device = "png")
+```
+
+![](https://www.caciqueinc.com/wp-content/uploads/2017/12/blank-overlay.png)
+
+## CTree Model
+```{r}
+drops <- "killed"
+tdata <- train2[ , !(names(train2) %in% drops)]
+test2data <- test2[ , !(names(test2) %in% drops)]
+tree <- rpart(died ~ .,data = tdata)
+rpart.plot(tree)
+```
+```{r}
+pred.cart<-predict(tree,newdata=test2data,type="class")
+table(test2data$died,pred.cart,dnn=c("Actual","Prediction"))
+```
+
+```{r}
+dataF<-data.frame("Actual"=test2data$died,"Prediction"=pred.cart)
+TPdataF<-subset(dataF,Actual=="yes"&Prediction=="yes")
+FPdataF<-subset(dataF,Actual=="no"&Prediction=="yes")
+TNdataF<-subset(dataF,Actual=="no"&Prediction=="no")
+FNdataF<-subset(dataF,Actual=="yes"&Prediction=="no")
+TP<-nrow(TPdataF)
+FP<-nrow(FPdataF)
+TN<-nrow(TNdataF)
+FN<-nrow(FNdataF)
+Accuracy<-(TP+TN)/(TP+TN+FP+FN)
+Precision<-TP/(TP+FP)
+Recall<-TP/(TP+FN)
+cat("Accuracy:",Accuracy,"\n")
+cat("Precision:",Precision,"\n")
+cat("Recall:",Recall,"\n")
+```
+
+```{r}
+# Tree Plot
+# library(ggthemes)
+treeActual <- data.frame(data = dataF$Actual, type = "Actual")
+treePredic <- data.frame(data = dataF$Prediction, type = "Predicted")
+tPlot <- rbind(treeActual,treePredic)
+#tPlot$data <- ifelse(tPlot$data == 1, "yes","no")
+treePlot <- ggplot(tPlot, aes(data, fill = data)) + geom_bar() + facet_wrap(~type) + theme_few() + scale_fill_gdocs() + labs( title = "CTree Accuracy Comparison", x = "People Killed", y = "Amount", fill = "Killed")
+treePlot
+#ggsave(filename = "Tree Accuracy.png", plot = treePlot, device = "png")
+```
+
+![](https://www.caciqueinc.com/wp-content/uploads/2017/12/blank-overlay.png)
+ 
+## Anova
+Anova to compare the accuracy of the Logictic, Naive Bayes, and CTree Model.
+
+```{r}
+# Anova Preparation
+# Naive Bayes
+naive_results$Accuracy <- ifelse(naive_results$Actual == naive_results$Prediction, 1, 0)
+aovNaive <- data.frame(Accuracy = naive_results$Accuracy, Model = "Naive Bayes" )
+
+# Logistic Regression
+result_probGLM$Accuracy <- ifelse(result_probGLM$Actual == result_probGLM$Prediction, 1, 0)
+aovLogistic <- data.frame(Accuracy = result_probGLM$Accuracy, Model = "Logistic" )
+
+# Tree
+dataF$Accurracy <- ifelse(dataF$Actual == dataF$Prediction, 1, 0)
+aovTree <- data.frame(Accuracy = dataF$Accurracy, Model = "Tree" )
+
+# Bind Models
+anovaModels <- rbind(aovNaive,aovLogistic,aovTree)
+
+
+# Anova
+
+aovModels <- aov(Accuracy ~ Model, data = anovaModels)
+summary(aovModels)
+```
+
+```{r}
+TukeyHSD(aovModels)
+```
+
+```{r}
+modelsAccurracy <- data.frame(Models = c("Logistic","Naive Bayes","CTree"),Accuracy = c(0.52267,0.6719514,0.7709001))
+AccuracyPlot <-  ggplot(modelsAccurracy, aes(Models,Accuracy,fill = Models)) + geom_col() + theme_few() + scale_fill_gdocs() + labs(title = "Comparison of Accuracy") + theme(legend.position = "none") + geom_text(aes(label = Accuracy), size = 3, hjust = 0.5, vjust = -2, position = "stack") + ylim(0,1)
+AccuracyPlot
+#ggsave(filename = "Accuracy.png", plot = AccuracyPlot, device = "png")
+```
+![](https://www.caciqueinc.com/wp-content/uploads/2017/12/blank-overlay.png)
